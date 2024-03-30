@@ -34,10 +34,10 @@ func (f *CurrentFolderWalker) List(dir string, query string, regex bool, r *rege
 	if err != nil {
 		fmt.Println(err.Error())
 	}
-	for _, f := range files {
-		fmt.Println(f.Name())
-		readFile(dir+"\\"+f.Name(), query, regex, r)
-
+	for _, file := range files {
+		filePath := filepath.Join(dir, file.Name())
+		fmt.Println(file.Name())
+		readFile(filePath, query, regex, r)
 	}
 }
 
