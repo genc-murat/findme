@@ -76,50 +76,61 @@ func (f *FileWalkerStrategy) List(dir string, query string, regex bool, r *regex
 }
 
 func main() {
-	var dirPath string
-	var query string
-	var isRegex bool
-	var isRecursive bool
+	var dirPath, query string
+	var isRegex, isRecursive bool
+
 	strategy := NewFileWalkerStrategy()
 	strategy.Add(Current, &CurrentFolderWalker{})
 	strategy.Add(Recursive, &RecursiveFolderWalker{})
+
 	app := &cli.App{
-		Flags: []cli.Flag{
-			&cli.StringFlag{
-				Name:        "dir",
-				Value:       "",
-				Usage:       "Directory",
-				Destination: &dirPath,
-			}, &cli.StringFlag{
-				Name:        "query",
-				Value:       "",
-				Usage:       "Search...",
-				Destination: &query,
-			}, &cli.BoolFlag{
-				Name:        "regex",
-				Value:       false,
-				Usage:       "Regex...",
-				Destination: &isRegex,
-			}, &cli.BoolFlag{
-				Name:        "recursive",
-				Value:       false,
-				Usage:       "Scan all subfolders",
-				Destination: &isRecursive,
+		Commands: []*cli.Command{
+			{
+				Name:  "search",
+				Usage: "Search files in a directory",
+				Flags: []cli.Flag{
+					&cli.StringFlag{
+						Name:        "dir",
+						Aliases:     []string{"d"},
+						Usage:       "Directory to search in",
+						Destination: &dirPath,
+						Required:    true,
+					},
+					&cli.StringFlag{
+						Name:        "query",
+						Aliases:     []string{"q"},
+						Usage:       "Search query",
+						Destination: &query,
+						Required:    true,
+					},
+					&cli.BoolFlag{
+						Name:        "regex",
+						Aliases:     []string{"r"},
+						Usage:       "Use regular expression for search",
+						Destination: &isRegex,
+					},
+					&cli.BoolFlag{
+						Name:        "recursive",
+						Aliases:     []string{"R"},
+						Usage:       "Search recursively in subdirectories",
+						Destination: &isRecursive,
+					},
+				},
+				Action: func(c *cli.Context) error {
+					var regex *regexp.Regexp
+					if isRegex {
+						regex, _ = regexp.Compile(query)
+					}
+
+					walkerType := Current
+					if isRecursive {
+						walkerType = Recursive
+					}
+
+					strategy.List(dirPath, query, isRegex, regex, walkerType)
+					return nil
+				},
 			},
-		},
-		Action: func(c *cli.Context) error {
-			var regex *regexp.Regexp
-			if isRegex {
-				regex, _ = regexp.Compile(query)
-			}
-
-			var walkerType FileWalkerType = Current
-			if isRecursive {
-				walkerType = Recursive
-			}
-
-			strategy.List(dirPath, query, isRegex, regex, walkerType)
-			return nil
 		},
 	}
 
