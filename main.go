@@ -2,10 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"log"
-	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -141,17 +141,19 @@ func main() {
 }
 
 func readFile(fileName string, query string, regex bool, r *regexp.Regexp) {
+	if _, err := os.Stat(fileName); os.IsNotExist(err) {
+		fmt.Println("Error: File", fileName, "does not exist.")
+		return
+	}
 
 	file, err := os.Open(fileName)
-
 	if err != nil {
 		fmt.Println(err)
 		return
 	}
-
 	defer file.Close()
-	Process(file, query, regex, r)
 
+	Process(file, query, regex, r)
 }
 
 func Process(f *os.File, query string, regex bool, re *regexp.Regexp) error {
@@ -206,49 +208,43 @@ func Process(f *os.File, query string, regex bool, re *regexp.Regexp) error {
 }
 
 func ProcessChunk(chunk []byte, linesPool *sync.Pool, stringPool *sync.Pool, query string, fileName string, regex bool, r *regexp.Regexp) {
-
 	var waitGroupLines sync.WaitGroup
 
-	lines := string(chunk)
+	reader := bufio.NewReader(bytes.NewReader(chunk))
 
-	linesPool.Put(&chunk)
-
-	linesSlice := strings.Split(lines, "\n")
-
-	chunkSize := 300
-	n := len(linesSlice)
-	noOfThread := n / chunkSize
-
-	if n%chunkSize != 0 {
-		noOfThread++
-	}
-
-	for i := 0; i < (noOfThread); i++ {
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			fmt.Println(err)
+			break
+		}
 
 		waitGroupLines.Add(1)
-		go func(s int, e int) {
+		go func(line string) {
 			defer waitGroupLines.Done()
-			for i := s; i < e; i++ {
-				text := linesSlice[i]
-				if len(text) == 0 {
-					continue
-				}
 
-				if regex {
-					if r.MatchString(text) {
-						fmt.Println(color.Error.Sprintf("%s %s", query, fileName))
-					}
-				} else {
-					if strings.Contains(text, query) {
-						fmt.Println(color.Error.Sprintf("%s %s", query, fileName))
-					}
-				}
+			line = strings.TrimRight(line, "\r\n")
 
+			if len(line) == 0 {
+				return
 			}
 
-		}(i*chunkSize, int(math.Min(float64((i+1)*chunkSize), float64(len(linesSlice)))))
+			if regex {
+				if r.MatchString(line) {
+					fmt.Println(color.Error.Sprintf("%s %s", query, fileName))
+				}
+			} else {
+				if strings.Contains(line, query) {
+					fmt.Println(color.Error.Sprintf("%s %s", query, fileName))
+				}
+			}
+		}(line)
 	}
 
 	waitGroupLines.Wait()
-	linesSlice = nil
+
+	linesPool.Put(&chunk)
 }
