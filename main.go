@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -157,7 +159,6 @@ func readFile(fileName string, query string, regex bool, r *regexp.Regexp) {
 }
 
 func Process(f *os.File, query string, regex bool, re *regexp.Regexp) error {
-
 	linesPool := sync.Pool{New: func() interface{} {
 		lines := make([]byte, 250*1024)
 		return lines
@@ -168,16 +169,23 @@ func Process(f *os.File, query string, regex bool, re *regexp.Regexp) error {
 		return lines
 	}}
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	chunkChan := make(chan []byte)
+
+	numWorkers := runtime.NumGoroutine()
+	queryHash := calculateHash(query)
+
+	for i := 0; i < numWorkers; i++ {
+		go processChunkWorker(ctx, chunkChan, &linesPool, &stringPool, query, f.Name(), regex, re, queryHash) // Pass queryHash
+	}
+
 	r := bufio.NewReader(f)
-
-	var waitGroupFiles sync.WaitGroup
-
 	for {
 		buf := linesPool.Get().([]byte)
-
 		n, err := r.Read(buf)
 		buf = buf[:n]
-
 		if n == 0 {
 			if err != nil {
 				fmt.Println(err)
@@ -190,46 +198,38 @@ func Process(f *os.File, query string, regex bool, re *regexp.Regexp) error {
 		}
 
 		nextUntillNewline, err := r.ReadBytes('\n')
-
 		if err != io.EOF {
 			buf = append(buf, nextUntillNewline...)
 		}
 
-		waitGroupFiles.Add(1)
-		go func() {
-			ProcessChunk(buf, &linesPool, &stringPool, query, f.Name(), regex, re)
-			waitGroupFiles.Done()
-		}()
-
+		select {
+		case chunkChan <- buf:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
-	waitGroupFiles.Wait()
+	close(chunkChan)
 	return nil
 }
 
-func ProcessChunk(chunk []byte, linesPool *sync.Pool, stringPool *sync.Pool, query string, fileName string, regex bool, r *regexp.Regexp) {
-	var waitGroupLines sync.WaitGroup
+func processChunkWorker(ctx context.Context, chunkChan <-chan []byte, linesPool *sync.Pool, stringPool *sync.Pool, query string, fileName string, regex bool, r *regexp.Regexp, queryHash uint32) { // Accept queryHash
 
-	reader := bufio.NewReader(bytes.NewReader(chunk))
-
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			if err == io.EOF {
+	for chunk := range chunkChan {
+		reader := bufio.NewReader(bytes.NewReader(chunk))
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				if err == io.EOF {
+					break
+				}
+				fmt.Println(err)
 				break
 			}
-			fmt.Println(err)
-			break
-		}
-
-		waitGroupLines.Add(1)
-		go func(line string) {
-			defer waitGroupLines.Done()
 
 			line = strings.TrimRight(line, "\r\n")
-
 			if len(line) == 0 {
-				return
+				continue
 			}
 
 			if regex {
@@ -237,14 +237,24 @@ func ProcessChunk(chunk []byte, linesPool *sync.Pool, stringPool *sync.Pool, que
 					fmt.Println(color.Error.Sprintf("%s %s", query, fileName))
 				}
 			} else {
-				if strings.Contains(line, query) {
-					fmt.Println(color.Error.Sprintf("%s %s", query, fileName))
+				for i := 0; i <= len(line)-len(query); i++ {
+					windowHash := calculateHash(line[i : i+len(query)])
+					if windowHash == queryHash && line[i:i+len(query)] == query {
+						fmt.Println(color.Error.Sprintf("%s %s", query, fileName))
+						break
+					}
 				}
 			}
-		}(line)
+		}
+
+		linesPool.Put(&chunk)
 	}
+}
 
-	waitGroupLines.Wait()
-
-	linesPool.Put(&chunk)
+func calculateHash(s string) uint32 {
+	var hash uint32
+	for _, c := range s {
+		hash = hash*31 + uint32(c)
+	}
+	return hash
 }
