@@ -15,6 +15,7 @@ import (
 	"sync"
 
 	"github.com/gookit/color"
+	"github.com/spaolacci/murmur3"
 	"github.com/urfave/cli/v2"
 )
 
@@ -26,12 +27,12 @@ const (
 )
 
 type FileWalker interface {
-	List(dir string, query string, regex bool, r *regexp.Regexp)
+	List(dir string, query string, regex bool, r *regexp.Regexp, caseInsensitive, wholeWord bool)
 }
 
 type CurrentFolderWalker struct{}
 
-func (f *CurrentFolderWalker) List(dir string, query string, regex bool, r *regexp.Regexp) {
+func (f *CurrentFolderWalker) List(dir string, query string, regex bool, r *regexp.Regexp, caseInsensitive, wholeWord bool) {
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		fmt.Println(err.Error())
@@ -39,20 +40,21 @@ func (f *CurrentFolderWalker) List(dir string, query string, regex bool, r *rege
 	for _, file := range files {
 		filePath := filepath.Join(dir, file.Name())
 		fmt.Println(file.Name())
-		readFile(filePath, query, regex, r)
+		readFile(filePath, query, regex, r, caseInsensitive, wholeWord)
 	}
 }
 
 type RecursiveFolderWalker struct{}
 
-func (f *RecursiveFolderWalker) List(dir string, query string, regex bool, r *regexp.Regexp) {
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		fmt.Println(path)
-		readFile(path, query, regex, r)
-		return nil
-	})
+func (f *RecursiveFolderWalker) List(dir string, query string, regex bool, r *regexp.Regexp, caseInsensitive, wholeWord bool) {
+	files, err := os.ReadDir(dir)
 	if err != nil {
 		fmt.Println(err.Error())
+	}
+	for _, file := range files {
+		filePath := filepath.Join(dir, file.Name())
+		fmt.Println(file.Name())
+		readFile(filePath, query, regex, r, caseInsensitive, wholeWord)
 	}
 }
 
@@ -70,20 +72,16 @@ func (f *FileWalkerStrategy) Add(workerType FileWalkerType, fileWalker FileWalke
 	f.fileWalkers[workerType] = fileWalker
 }
 
-func (f *FileWalkerStrategy) List(dir string, query string, regex bool, r *regexp.Regexp, walkerType FileWalkerType) {
+func (f *FileWalkerStrategy) List(dir string, query string, regex bool, r *regexp.Regexp, walkerType FileWalkerType, caseInsensitive, wholeWord bool) {
 	if _, ok := f.fileWalkers[walkerType]; !ok {
 		fmt.Errorf("unknown walkertype")
 	}
-	f.fileWalkers[walkerType].List(dir, query, regex, r)
+	f.fileWalkers[walkerType].List(dir, query, regex, r, caseInsensitive, wholeWord)
 }
 
 func main() {
 	var dirPath, query string
-	var isRegex, isRecursive bool
-
-	strategy := NewFileWalkerStrategy()
-	strategy.Add(Current, &CurrentFolderWalker{})
-	strategy.Add(Recursive, &RecursiveFolderWalker{})
+	var isRegex, isRecursive, caseInsensitive, wholeWord bool
 
 	app := &cli.App{
 		Commands: []*cli.Command{
@@ -117,6 +115,18 @@ func main() {
 						Usage:       "Search recursively in subdirectories",
 						Destination: &isRecursive,
 					},
+					&cli.BoolFlag{
+						Name:        "case-insensitive",
+						Aliases:     []string{"i"},
+						Usage:       "Perform case-insensitive search",
+						Destination: &caseInsensitive,
+					},
+					&cli.BoolFlag{
+						Name:        "whole-word",
+						Aliases:     []string{"w"},
+						Usage:       "Match whole words only",
+						Destination: &wholeWord,
+					},
 				},
 				Action: func(c *cli.Context) error {
 					var regex *regexp.Regexp
@@ -129,41 +139,112 @@ func main() {
 						walkerType = Recursive
 					}
 
-					strategy.List(dirPath, query, isRegex, regex, walkerType)
-					return nil
+					err := parallelListAndRead(dirPath, query, isRegex, regex, walkerType, caseInsensitive, wholeWord)
+					return err
 				},
 			},
 		},
 	}
-
 	err := app.Run(os.Args)
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func readFile(fileName string, query string, regex bool, r *regexp.Regexp) {
-	if _, err := os.Stat(fileName); os.IsNotExist(err) {
-		fmt.Println("Error: File", fileName, "does not exist.")
-		return
+func parallelListAndRead(dirPath, query string, regex bool, r *regexp.Regexp, walkerType FileWalkerType, caseInsensitive, wholeWord bool) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Channel to send file paths for reading
+	fileChan := make(chan string)
+
+	// Start goroutines to list files concurrently
+	var wgList sync.WaitGroup
+	numWorkers := runtime.NumGoroutine()
+	for i := 0; i < numWorkers; i++ {
+		wgList.Add(1)
+		go listFiles(ctx, dirPath, query, regex, r, walkerType, fileChan, &wgList)
 	}
 
+	// Start goroutines to read files concurrently
+	var wgRead sync.WaitGroup
+	for i := 0; i < numWorkers; i++ {
+		wgRead.Add(1)
+		go readFileWorker(ctx, fileChan, query, regex, r, &wgRead, caseInsensitive, wholeWord)
+	}
+
+	// Wait for file listing to complete
+	wgList.Wait()
+	close(fileChan)
+
+	// Wait for file reading to complete
+	wgRead.Wait()
+	return nil
+}
+
+// listFiles lists files based on the walkerType and sends file paths to the channel.
+func listFiles(ctx context.Context, dirPath, query string, regex bool, r *regexp.Regexp, walkerType FileWalkerType, fileChan chan<- string, wg *sync.WaitGroup) {
+	defer wg.Done()
+	strategy := NewFileWalkerStrategy()
+	strategy.Add(Current, &CurrentFolderWalker{})
+	strategy.Add(Recursive, &RecursiveFolderWalker{})
+	err := filepath.Walk(dirPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			select {
+			case fileChan <- path:
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		fmt.Println(err.Error())
+	}
+}
+
+func readFileWorker(ctx context.Context, fileChan <-chan string, query string, regex bool, r *regexp.Regexp, wg *sync.WaitGroup, caseInsensitive, wholeWord bool) {
+	defer wg.Done()
+
+	for {
+		select {
+		case fileName, ok := <-fileChan:
+			if !ok {
+				return // Channel closed
+			}
+			readFile(fileName, query, regex, r, caseInsensitive, wholeWord)
+
+		case <-ctx.Done():
+			return // Context canceled
+		}
+	}
+}
+
+func readFile(fileName string, query string, regex bool, r *regexp.Regexp, caseInsensitive, wholeWord bool) {
+	if _, err := os.Stat(fileName); os.IsNotExist(err) {
+		fmt.Printf("Error: File %s does not exist.\n", fileName)
+		return
+	}
 	file, err := os.Open(fileName)
 	if err != nil {
-		fmt.Println(err)
+		fmt.Printf("Error opening file %s: %v\n", fileName, err)
 		return
 	}
 	defer file.Close()
 
-	Process(file, query, regex, r)
+	// Use bufio.Reader for efficient file reading
+	reader := bufio.NewReader(file)
+	Process(reader, query, regex, r, fileName, caseInsensitive, wholeWord)
 }
 
-func Process(f *os.File, query string, regex bool, re *regexp.Regexp) error {
+func Process(reader *bufio.Reader, query string, regex bool, re *regexp.Regexp, fileName string, caseInsensitive, wholeWord bool) error {
 	linesPool := sync.Pool{New: func() interface{} {
 		lines := make([]byte, 250*1024)
 		return lines
 	}}
-
 	stringPool := sync.Pool{New: func() interface{} {
 		lines := ""
 		return lines
@@ -173,33 +254,32 @@ func Process(f *os.File, query string, regex bool, re *regexp.Regexp) error {
 	defer cancel()
 
 	chunkChan := make(chan []byte)
-
 	numWorkers := runtime.NumGoroutine()
 	queryHash := calculateHash(query)
 
+	var wg sync.WaitGroup
 	for i := 0; i < numWorkers; i++ {
-		go processChunkWorker(ctx, chunkChan, &linesPool, &stringPool, query, f.Name(), regex, re, queryHash) // Pass queryHash
+		wg.Add(1)
+		go processChunkWorker(ctx, chunkChan, &linesPool, &stringPool, query, fileName, regex, re, queryHash, &wg, caseInsensitive, wholeWord)
 	}
 
-	r := bufio.NewReader(f)
 	for {
 		buf := linesPool.Get().([]byte)
-		n, err := r.Read(buf)
+		n, err := reader.Read(buf)
 		buf = buf[:n]
 		if n == 0 {
 			if err != nil {
-				fmt.Println(err)
-				break
-			}
-			if err == io.EOF {
+				if err != io.EOF {
+					fmt.Println(err)
+				}
 				break
 			}
 			return err
 		}
 
-		nextUntillNewline, err := r.ReadBytes('\n')
+		nextUntilNewline, err := reader.ReadBytes('\n')
 		if err != io.EOF {
-			buf = append(buf, nextUntillNewline...)
+			buf = append(buf, nextUntilNewline...)
 		}
 
 		select {
@@ -210,51 +290,78 @@ func Process(f *os.File, query string, regex bool, re *regexp.Regexp) error {
 	}
 
 	close(chunkChan)
+	wg.Wait()
 	return nil
 }
 
-func processChunkWorker(ctx context.Context, chunkChan <-chan []byte, linesPool *sync.Pool, stringPool *sync.Pool, query string, fileName string, regex bool, r *regexp.Regexp, queryHash uint32) { // Accept queryHash
+func processChunkWorker(ctx context.Context, chunkChan <-chan []byte, linesPool *sync.Pool, stringPool *sync.Pool, query string, fileName string, regex bool, r *regexp.Regexp, queryHash uint32, wg *sync.WaitGroup, caseInsensitive, wholeWord bool) {
+	defer wg.Done()
 
-	for chunk := range chunkChan {
-		reader := bufio.NewReader(bytes.NewReader(chunk))
-		for {
-			line, err := reader.ReadString('\n')
-			if err != nil {
-				if err == io.EOF {
-					break
-				}
-				fmt.Println(err)
-				break
+	for {
+		select {
+		case chunk, ok := <-chunkChan:
+			if !ok {
+				return
 			}
 
-			line = strings.TrimRight(line, "\r\n")
-			if len(line) == 0 {
-				continue
-			}
-
-			if regex {
-				if r.MatchString(line) {
-					fmt.Println(color.Error.Sprintf("%s %s", query, fileName))
+			scanner := bufio.NewScanner(bytes.NewReader(chunk))
+			for scanner.Scan() {
+				line := scanner.Text()
+				line = strings.TrimRight(line, "\r\n")
+				if len(line) == 0 {
+					continue
 				}
-			} else {
-				for i := 0; i <= len(line)-len(query); i++ {
-					windowHash := calculateHash(line[i : i+len(query)])
-					if windowHash == queryHash && line[i:i+len(query)] == query {
+
+				var lineStr string
+				if v := stringPool.Get(); v != nil {
+					lineStr = v.(string)
+				} else {
+					lineStr = ""
+				}
+				lineStr = line
+
+				if regex {
+					if r.MatchString(lineStr) {
 						fmt.Println(color.Error.Sprintf("%s %s", query, fileName))
-						break
+					}
+				} else {
+					if caseInsensitive {
+						lineStr = strings.ToLower(lineStr)
+						query = strings.ToLower(query)
+					}
+
+					if wholeWord {
+						query = fmt.Sprintf("\\b%s\\b", query)
+						r, _ = regexp.Compile(query)
+						if r.MatchString(lineStr) {
+							fmt.Println(color.Error.Sprintf("%s %s", query, fileName))
+						}
+					} else {
+						for i := 0; i <= len(lineStr)-len(query); i++ {
+							windowHash := calculateHash(lineStr[i : i+len(query)])
+							if windowHash == queryHash && lineStr[i:i+len(query)] == query {
+								fmt.Println(color.Error.Sprintf("%s %s", query, fileName))
+								break
+							}
+						}
 					}
 				}
-			}
-		}
 
-		linesPool.Put(&chunk)
+				stringPool.Put(&lineStr)
+			}
+
+			if err := scanner.Err(); err != nil {
+				fmt.Printf("Error scanning chunk: %v\n", err)
+			}
+
+			linesPool.Put(&chunk)
+
+		case <-ctx.Done():
+			return
+		}
 	}
 }
 
 func calculateHash(s string) uint32 {
-	var hash uint32
-	for _, c := range s {
-		hash = hash*31 + uint32(c)
-	}
-	return hash
+	return murmur3.Sum32([]byte(s))
 }
